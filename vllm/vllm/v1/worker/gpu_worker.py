@@ -547,6 +547,9 @@ class Worker(WorkerBase):
         # because `initialize_kv_cache` will inject kv cache groups not
         # related to kv cache connector (e.g. kv cache sharing layers).
         ensure_kv_transfer_initialized(self.vllm_config, kv_cache_config)
+        # A KV connector (e.g. Mooncake probing the GPU topology) may change the
+        # current CUDA device; this worker keeps its own.
+        torch.cuda.set_device(self.device)
 
         if self.vllm_config.model_config.enable_sleep_mode:
             from vllm.device_allocator.cumem import CuMemAllocator
@@ -1080,6 +1083,12 @@ def init_worker_distributed_environment(
         parallel_config.prefill_context_parallel_size,
         parallel_config.decode_context_parallel_size,
     )
+
+    # Shunt: bind the per-iteration planner and elastic attention to this rank.
+    from vllm import shunt_integration
+
+    if shunt_integration.ENABLED:
+        shunt_integration.on_distributed_ready(vllm_config)
 
     # Init ec connector here before KV caches init
     # NOTE: We do not init KV caches for Encoder-only instance in EPD disagg mode
