@@ -1,0 +1,69 @@
+file(GLOB XPORT_SOURCES "*.cpp")
+
+add_subdirectory(rdma_transport)
+add_subdirectory(rpc_communicator)
+add_library(transport OBJECT ${XPORT_SOURCES} $<TARGET_OBJECTS:rdma_transport> $<TARGET_OBJECTS:rpc_communicator>)
+target_link_libraries(transport PRIVATE JsonCpp::JsonCpp yalantinglibs::yalantinglibs glog::glog pthread)
+
+if(USE_UB)
+  add_subdirectory(kunpeng_transport)
+  target_sources(transport PUBLIC $<TARGET_OBJECTS:ub_transport>)
+endif()
+
+if (USE_TCP)
+  add_subdirectory(tcp_transport)
+  target_sources(transport PUBLIC $<TARGET_OBJECTS:tcp_transport>)
+endif()
+
+if (USE_BAREX)
+  add_subdirectory(barex_transport)
+  target_sources(transport PUBLIC $<TARGET_OBJECTS:barex_transport>)
+endif()
+
+if (USE_NVMEOF)
+  add_subdirectory(nvmeof_transport)
+  target_sources(transport PUBLIC $<TARGET_OBJECTS:nvmeof_transport>)
+endif()
+
+if (USE_CXL)
+  add_subdirectory(cxl_transport)
+  target_sources(transport PUBLIC $<TARGET_OBJECTS:cxl_transport>)
+endif()
+
+if (USE_ASCEND_DIRECT)
+  add_subdirectory(ascend_transport)
+elseif(USE_ASCEND)
+  add_subdirectory(ascend_transport)
+  target_sources(transport PUBLIC $<TARGET_OBJECTS:ascend_transport>)
+endif()
+
+if (USE_ASCEND_HETEROGENEOUS)
+  add_subdirectory(ascend_transport)
+  target_sources(transport PUBLIC $<TARGET_OBJECTS:ascend_transport>)
+endif()
+
+if (USE_HIP)
+  add_subdirectory(hip_transport)
+  target_sources(transport PUBLIC $<TARGET_OBJECTS:hip_transport>)
+endif()
+
+if (USE_MNNVL AND NOT USE_HIP)
+  add_subdirectory(nvlink_transport)
+  target_sources(transport PUBLIC $<TARGET_OBJECTS:nvlink_transport>)
+endif()
+
+if (USE_INTRA_NVLINK)
+      add_subdirectory(intranode_nvlink_transport)
+      target_sources(transport PUBLIC $<TARGET_OBJECTS:intranode_nvlink_transport>)
+endif()
+
+if (USE_UBSHMEM)
+  add_subdirectory(ascend_transport)
+  target_sources(transport PUBLIC $<TARGET_OBJECTS:ascend_transport>)
+endif()
+
+if (USE_EFA)
+  add_subdirectory(efa_transport)
+  target_sources(transport PUBLIC $<TARGET_OBJECTS:efa_transport>)
+  target_link_libraries(transport PRIVATE fabric)
+endif()

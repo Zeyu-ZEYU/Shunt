@@ -1,0 +1,781 @@
+#pragma once
+
+#include <atomic>
+#include <boost/functional/hash.hpp>
+#include <memory>
+#include <mutex>
+#include <optional>
+#include <string>
+#include <thread>
+#include <vector>
+#include <ylt/util/tl/expected.hpp>
+#include <chrono>
+#include <unordered_set>
+
+#include "client_metric.h"
+#include "ha/leadership/leader_coordinator.h"
+#include "master_client.h"
+#include "storage_backend.h"
+#include "thread_pool.h"
+#include "transfer_engine.h"
+#include "transfer_task.h"
+#include "types.h"
+#include "replica.h"
+#include "master_metric_manager.h"
+#include "count_min_sketch.h"
+#include "local_hot_cache.h"
+#include "pinned_buffer_pool.h"
+
+namespace mooncake {
+
+class PutOperation;
+
+/**
+ * @brief Result of a query operation containing replica information and lease
+ * timeout
+ */
+class QueryResult {
+   public:
+    /** @brief List of available replicas for the queried key */
+    const std::vector<Replica::Descriptor> replicas;
+    /** @brief Time point when the lease for this key expires */
+    const std::chrono::steady_clock::time_point lease_timeout;
+
+    QueryResult(std::vector<Replica::Descriptor>&& replicas_param,
+                std::chrono::steady_clock::time_point lease_timeout_param)
+        : replicas(std::move(replicas_param)),
+          lease_timeout(lease_timeout_param) {}
+
+    bool IsLeaseExpired() const {
+        return std::chrono::steady_clock::now() >= lease_timeout;
+    }
+
+    bool IsLeaseExpired(std::chrono::steady_clock::time_point& now) const {
+        return now >= lease_timeout;
+    }
+};
+
+/**
+ * @brief Client for interacting with the mooncake distributed object store
+ */
+class Client {
+   public:
+    ~Client();
+
+    const UUID& getClientId() const { return client_id_; }
+
+    /**
+     * @brief Creates and initializes a new Client instance
+     * @param local_hostname Local host address (IP:Port)
+     * @param metadata_connstring Connection string for metadata service
+     * @param protocol Transfer protocol ("rdma" or "tcp")
+     * @param device_names Comma-separated RDMA device names.
+     *        Optional with default auto-discovery. Only required when
+     *        auto-discovery is disabled (set env `MC_MS_AUTO_DISC=0`).
+     * @param master_server_entry The entry of master server (IP:Port of master
+     *        address for non-HA mode, or <backend>://connstring for HA mode,
+     *        e.g. etcd://IP:Port;IP:Port;...;IP:Port)
+     * @return std::optional containing a shared_ptr to Client if successful,
+     * std::nullopt otherwise
+     */
+    static std::optional<std::shared_ptr<Client>> Create(
+        const std::string& local_hostname,
+        const std::string& metadata_connstring, const std::string& protocol,
+        const std::optional<std::string>& device_names = std::nullopt,
+        const std::string& master_server_entry = kDefaultMasterAddress,
+        const std::shared_ptr<TransferEngine>& transfer_engine = nullptr,
+        std::map<std::string, std::string> labels = {});
+
+    /**
+     * @brief Retrieves data for a given key
+     * @param object_key Key to retrieve
+     * @param slices Vector of slices to store the retrieved data
+     * @return ErrorCode indicating success/failure
+     */
+    tl::expected<void, ErrorCode> Get(const std::string& object_key,
+                                      std::vector<Slice>& slices);
+
+    /**
+     * @brief Batch retrieve data for multiple keys
+     * @param object_keys Keys to query
+     * @param slices Map of object keys to their data slices
+     */
+    std::vector<tl::expected<void, ErrorCode>> BatchGet(
+        const std::vector<std::string>& object_keys,
+        std::unordered_map<std::string, std::vector<Slice>>& slices);
+
+    /**
+     * @brief Batch query IP addresses for multiple client IDs.
+     * @param client_ids Vector of client UUIDs to query.
+     * @return An expected object containing a map from client_id to their IP
+     * address lists on success, or an ErrorCode on failure.
+     */
+    tl::expected<
+        std::unordered_map<UUID, std::vector<std::string>, boost::hash<UUID>>,
+        ErrorCode>
+    BatchQueryIp(const std::vector<UUID>& client_ids);
+
+    /**
+     * @brief Gets object metadata without transferring data
+     * @param object_key Key to query
+     * @return QueryResult containing replicas and lease timeout, or ErrorCode
+     * indicating failure
+     */
+    tl::expected<QueryResult, ErrorCode> Query(const std::string& object_key);
+
+    /**
+     * @brief Queries replica lists for object keys that match a regex pattern.
+     * @param str The regular expression string to match against object keys.
+     * @return An expected object containing a map from object keys to their
+     * replica descriptors on success, or an ErrorCode on failure.
+     */
+    tl::expected<
+        std::unordered_map<std::string, std::vector<Replica::Descriptor>>,
+        ErrorCode>
+    QueryByRegex(const std::string& str);
+
+    /**
+     * @brief Batch query object metadata without transferring data
+     * @param object_keys Keys to query
+     * @return Vector of QueryResult objects containing replicas and lease
+     * timeouts
+     */
+    std::vector<tl::expected<QueryResult, ErrorCode>> BatchQuery(
+        const std::vector<std::string>& object_keys);
+
+    /**
+     * @brief Batch clear KV cache for specified object keys on a specific
+     * segment for a given client.
+     * @param object_keys Vector of object key strings to clear.
+     * @param client_id The UUID of the client that owns the object keys.
+     * @param segment_name The name of the segment (storage device) to clear
+     * from.
+     * @return An expected object containing a vector of successfully cleared
+     * object keys on success, or an ErrorCode on failure.
+     */
+    tl::expected<std::vector<std::string>, ErrorCode> BatchReplicaClear(
+        const std::vector<std::string>& object_keys, const UUID& client_id,
+        const std::string& segment_name);
+
+    /**
+     * @brief Transfers data using pre-queried object information
+     * @param object_key Key of the object
+     * @param query_result Previously queried object metadata containing
+     * replicas and lease timeout
+     * @param slices Vector of slices to store the data
+     * @return ErrorCode indicating success/failure
+     */
+    tl::expected<void, ErrorCode> Get(const std::string& object_key,
+                                      const QueryResult& query_result,
+                                      std::vector<Slice>& slices);
+    tl::expected<void, ErrorCode> Get(const std::string& object_key,
+                                      const QueryResult& query_result,
+                                      std::vector<Slice>& slices,
+                                      uint64_t src_offset);
+    /**
+     * @brief Transfers data using pre-queried object information
+     * @param object_keys Keys of the objects
+     * @param query_results Previously queried object metadata for each key
+     * @param slices Map of object keys to their data slices
+     * @return Vector of ErrorCode results for each object
+     */
+    std::vector<tl::expected<void, ErrorCode>> BatchGet(
+        const std::vector<std::string>& object_keys,
+        const std::vector<QueryResult>& query_results,
+        std::unordered_map<std::string, std::vector<Slice>>& slices,
+        bool prefer_same_node = false);
+
+    /**
+     * @brief Stores data with replication
+     * @param key Object key
+     * @param slices Vector of data slices to store
+     * @param config Replication configuration
+     * @return ErrorCode indicating success/failure
+     */
+    tl::expected<void, ErrorCode> Put(const ObjectKey& key,
+                                      std::vector<Slice>& slices,
+                                      const ReplicateConfig& config);
+
+    /**
+     * @brief Batch put data with replication
+     * @param keys Object keys
+     * @param batched_slices Vector of vectors of data slices to store (indexed
+     * to match keys)
+     * @param config Replication configuration
+     */
+    std::vector<tl::expected<void, ErrorCode>> BatchPut(
+        const std::vector<ObjectKey>& keys,
+        std::vector<std::vector<Slice>>& batched_slices,
+        const ReplicateConfig& config);
+
+    /**
+     * @brief Upserts data: inserts if key doesn't exist, updates if it does
+     * @param key Object key
+     * @param slices Vector of data slices to store
+     * @param config Replication configuration
+     * @return ErrorCode indicating success/failure
+     */
+    tl::expected<void, ErrorCode> Upsert(const ObjectKey& key,
+                                         std::vector<Slice>& slices,
+                                         const ReplicateConfig& config);
+
+    /**
+     * @brief Batch upsert data with replication
+     * @param keys Object keys
+     * @param batched_slices Vector of vectors of data slices
+     * @param config Replication configuration
+     */
+    std::vector<tl::expected<void, ErrorCode>> BatchUpsert(
+        const std::vector<ObjectKey>& keys,
+        std::vector<std::vector<Slice>>& batched_slices,
+        const ReplicateConfig& config);
+
+    /**
+     * @brief Removes an object and all its replicas
+     * @param key Key to remove
+     * @param force If true, skip lease and replication task checks
+     * @return ErrorCode indicating success/failure
+     */
+    tl::expected<void, ErrorCode> Remove(const ObjectKey& key,
+                                         bool force = false);
+
+    /**
+     * @brief Removes objects from the store whose keys match a regex pattern.
+     * @param str The regular expression string to match against object keys.
+     * @param force If true, skip lease and replication task checks
+     * @return An expected object containing the number of removed objects on
+     * success, or an ErrorCode on failure.
+     */
+    tl::expected<long, ErrorCode> RemoveByRegex(const ObjectKey& str,
+                                                bool force = false);
+
+    /**
+     * @brief Removes all objects and all its replicas
+     * @param force If true, skip lease and replication task checks
+     * @return tl::expected<long, ErrorCode> number of removed objects or error
+     */
+    tl::expected<long, ErrorCode> RemoveAll(bool force = false);
+
+    /**
+     * @brief Batch remove objects and all their replicas
+     * @param keys List of keys to remove
+     * @param force If true, skip lease and replication task checks
+     * @return Vector of expected results for each key
+     */
+    std::vector<tl::expected<void, ErrorCode>> BatchRemove(
+        const std::vector<ObjectKey>& keys, bool force = false);
+
+    /**
+     * @brief Notify master that a disk replica was evicted locally
+     * @param key The evicted object key
+     * @param replica_type DISK or LOCAL_DISK
+     */
+    tl::expected<void, ErrorCode> EvictDiskReplica(const std::string& key,
+                                                   ReplicaType replica_type);
+
+    std::vector<tl::expected<void, ErrorCode>> BatchEvictDiskReplica(
+        const std::vector<std::string>& keys, ReplicaType replica_type);
+
+    /**
+     * @brief Registers a memory segment to master for allocation
+     * @param buffer Memory buffer to register
+     * @param size Size of the buffer in bytes
+     * @return ErrorCode indicating success/failure
+     */
+    tl::expected<void, ErrorCode> MountSegment(
+        const void* buffer, size_t size, const std::string& protocol = "tcp",
+        const std::string& location = kWildcardLocation);
+
+    /**
+     * @brief Unregisters a memory segment from master
+     * @param buffer Memory buffer to unregister
+     * @param size Size of the buffer in bytes
+     * @return ErrorCode indicating success/failure
+     */
+    tl::expected<void, ErrorCode> UnmountSegment(const void* buffer,
+                                                 size_t size);
+
+    /**
+     * @brief Mounts a memory segment and returns its generated Segment UUID.
+     *        Logic is identical to MountSegment, but returns the segment id.
+     */
+    tl::expected<UUID, ErrorCode> MountSegmentAndGetId(
+        const void* buffer, size_t size, const std::string& protocol = "tcp",
+        const std::string& location = kWildcardLocation);
+
+    /**
+     * @brief Unmounts a segment by its UUID.
+     *        Logic is identical to UnmountSegment, but looks up by id.
+     */
+    tl::expected<void, ErrorCode> UnmountSegmentById(const UUID& segment_id);
+
+    /**
+     * @brief Registers memory buffer with TransferEngine for data transfer
+     * @param addr Memory address to register
+     * @param length Size of the memory region
+     * @param location Device location (e.g. "cpu:0")
+     * @param remote_accessible Whether the memory can be accessed remotely
+     * @param update_metadata Whether to update metadata service
+     * @return ErrorCode indicating success/failure
+     */
+    tl::expected<void, ErrorCode> RegisterLocalMemory(
+        void* addr, size_t length, const std::string& location,
+        bool remote_accessible = true, bool update_metadata = true);
+
+    /**
+     * @brief Unregisters memory buffer from TransferEngine
+     * @param addr Memory address to unregister
+     * @param update_metadata Whether to update metadata service
+     * @return ErrorCode indicating success/failure
+     */
+    tl::expected<void, ErrorCode> unregisterLocalMemory(
+        void* addr, bool update_metadata = true);
+
+    /**
+     * @brief Checks if an object exists
+     * @param key Key to check
+     * @return ErrorCode::OK if exists, ErrorCode::OBJECT_NOT_FOUND if not
+     * exists, other ErrorCode for errors
+     */
+    tl::expected<bool, ErrorCode> IsExist(const std::string& key);
+
+    /**
+     * @brief Checks if multiple objects exist
+     * @param keys Vector of keys to check
+     * @return Vector of existence results for each key
+     */
+    std::vector<tl::expected<bool, ErrorCode>> BatchIsExist(
+        const std::vector<std::string>& keys);
+
+    /**
+     * @brief Create a copy task to copy an object's replicas to target segments
+     * @param key Object key
+     * @param targets Target segments
+     * @return tl::expected<UUID, ErrorCode> Task ID on success, ErrorCode on
+     * failure
+     */
+    tl::expected<UUID, ErrorCode> CreateCopyTask(
+        const std::string& key, const std::vector<std::string>& targets);
+
+    /**
+     * @brief Create a move task to move an object's replica from source segment
+     * to target segment
+     * @param key Object key
+     * @param source Source segment
+     * @param target Target segment
+     * @return tl::expected<UUID, ErrorCode> Task ID on success, ErrorCode on
+     * failure
+     */
+    tl::expected<UUID, ErrorCode> CreateMoveTask(const std::string& key,
+                                                 const std::string& source,
+                                                 const std::string& target);
+
+    /**
+     * @brief Query a task by task id
+     * @param task_id Task ID to query
+     * @return tl::expected<QueryTaskResponse, ErrorCode> Task basic info
+     * on success, ErrorCode on failure
+     */
+    tl::expected<QueryTaskResponse, ErrorCode> QueryTask(const UUID& task_id);
+
+    /**
+     * @brief Get global segment base address for cxl protocol
+     * @return Global segment base address
+     */
+    void* GetBaseAddr();
+
+    /**
+     * @brief Mounts a local disk segment into the master.
+     * @param enable_offloading If true, enables offloading (write-to-file).
+     */
+    tl::expected<void, ErrorCode> MountLocalDiskSegment(bool enable_offloading);
+
+    /**
+     * @brief Heartbeat call to collect object-level statistics and retrieve the
+     * set of non-offloaded objects.
+     * @param enable_offloading Indicates whether offloading is enabled for this
+     * segment.
+     * @param offloading_objects On return, contains a map from object key to
+     * size (in bytes) for all objects that require offload.
+     */
+    tl::expected<void, ErrorCode> OffloadObjectHeartbeat(
+        bool enable_offloading,
+        std::unordered_map<std::string, int64_t>& offloading_objects);
+
+    /**
+     * @brief Performs a batched read of multiple objects using a
+     * high-throughput Transfer Engine.
+     * @param transfer_engine_addr Address of the Transfer Engine service (e.g.,
+     * "ip:port").
+     * @param keys List of keys identifying the data objects to be transferred
+     * @param pointers Array of destination memory addresses on the remote node
+     *                         where data will be written (one per key)
+     * @param batch_slices Map from object key to its data slice
+     * (`mooncake::Slice`), containing raw bytes to be written.
+     */
+    tl::expected<void, ErrorCode> BatchGetOffloadObject(
+        const std::string& transfer_engine_addr,
+        const std::vector<std::string>& keys,
+        const std::vector<uintptr_t>& pointers,
+        const std::unordered_map<std::string, Slice>& batch_slices);
+
+    /**
+     * @brief Notifies the master that offloading of specified objects has
+     * succeeded.
+     * @param keys         A list of object keys (names) that were successfully
+     * offloaded.
+     * @param metadatas    The corresponding metadata for each offloaded object,
+     * including size, storage location, etc.
+     */
+    tl::expected<void, ErrorCode> NotifyOffloadSuccess(
+        const std::vector<std::string>& keys,
+        const std::vector<StorageObjectMetadata>& metadatas);
+
+    /**
+     * @brief Fetch tasks assigned to a client
+     * @param batch_size Number of tasks to fetch
+     * @return tl::expected<std::vector<TaskAssignment>, ErrorCode> list of
+     * tasks on success, ErrorCode on failure
+     */
+    tl::expected<std::vector<TaskAssignment>, ErrorCode> FetchTasks(
+        size_t batch_size);
+
+    /**
+     * @brief Mark the task as complete
+     * @param task_complete Task complete request
+     * @return tl::expected<void, ErrorCode> indicating success/failure
+     */
+    tl::expected<void, ErrorCode> MarkTaskToComplete(
+        const TaskCompleteRequest& task_complete);
+
+    // For human-readable metrics
+    tl::expected<std::string, ErrorCode> GetSummaryMetrics() {
+        if (metrics_ == nullptr) {
+            return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+        }
+        return metrics_->summary_metrics();
+    }
+
+    tl::expected<MasterMetricManager::CacheHitStatDict, ErrorCode>
+    CalcCacheStats() {
+        return master_client_.CalcCacheStats();
+    }
+
+    void ObserveTransferOperation(TransferOperationKind kind,
+                                  const std::string& op_name, uint64_t bytes,
+                                  uint64_t latency_us) {
+        if (metrics_ != nullptr) {
+            metrics_->ObserveTransferOperation(kind, op_name, bytes,
+                                               latency_us);
+        }
+    }
+
+    // For Prometheus-style metrics
+    tl::expected<std::string, ErrorCode> SerializeMetrics() {
+        if (metrics_ == nullptr) {
+            return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+        }
+        std::string str;
+        metrics_->serialize(str);
+        return str;
+    }
+
+    SsdMetric* GetSsdMetricPtr() {
+        return metrics_ ? &metrics_->ssd_metric : nullptr;
+    }
+
+    [[nodiscard]] std::string GetTransportEndpoint() {
+        return transfer_engine_->getLocalIpAndPort();
+    }
+
+    // Return sorted NUMA node IDs that have at least one RDMA NIC.
+    [[nodiscard]] std::vector<int> GetNicNumaNodes() const;
+
+    tl::expected<Replica::Descriptor, ErrorCode> GetPreferredReplica(
+        const std::vector<Replica::Descriptor>& replica_list);
+    /**
+     * @brief Check if local hot cache is enabled
+     * @return true if hot cache is enabled, false otherwise
+     */
+    bool IsHotCacheEnabled() const { return hot_cache_ != nullptr; }
+
+    /**
+     * @brief Get the local hot cache instance.
+     * @return shared_ptr to LocalHotCache, or nullptr if disabled.
+     */
+    std::shared_ptr<LocalHotCache> GetHotCache() const { return hot_cache_; }
+
+    /**
+     * @brief Get the number of cache blocks in local hot cache
+     * @return Number of cache blocks if hot cache is enabled, 0 otherwise
+     */
+    size_t GetLocalHotCacheBlockCount() const {
+        if (hot_cache_ != nullptr) {
+            return hot_cache_->GetCacheSize();
+        }
+        return 0;
+    }
+
+    bool is_ping_healthy() const { return last_ping_success_.load(); }
+
+    /**
+     * @brief Get current frequency admission count for a key.
+     * @return estimated count, or 0 if admission sketch is disabled.
+     */
+    uint8_t GetAdmissionCount(const std::string& key) const {
+        if (admission_sketch_ == nullptr) {
+            return 0;
+        }
+        return admission_sketch_->count(key);
+    }
+
+    /**
+     * @brief Decide whether a key should be admitted to local hot cache.
+     * Updates admission sketch only when cache was not used.
+     */
+    bool ShouldAdmitToHotCache(const std::string& key, bool cache_used) {
+        if (!(hot_cache_ && !cache_used)) {
+            return false;
+        }
+        if (admission_sketch_ == nullptr) {
+            return true;
+        }
+        return admission_sketch_->increment(key) >= admission_threshold_;
+    }
+
+    bool IsReplicaOnLocalMemory(const Replica::Descriptor& replica);
+
+   private:
+    /**
+     * @brief Private constructor to enforce creation through Create() method
+     */
+    Client(const std::string& local_hostname,
+           const std::string& metadata_connstring, const std::string& protocol,
+           const std::map<std::string, std::string>& labels = {});
+
+    /**
+     * @brief Internal helper functions for initialization and data transfer
+     */
+    ErrorCode ConnectToMaster(const std::string& master_server_entry);
+    ErrorCode InitTransferEngine(
+        const std::string& local_hostname,
+        const std::string& metadata_connstring, const std::string& protocol,
+        const std::optional<std::string>& device_names);
+    void InitTransferSubmitter();
+    ErrorCode TransferData(const Replica::Descriptor& replica_descriptor,
+                           std::vector<Slice>& slices,
+                           TransferRequest::OpCode op_code);
+    ErrorCode TransferReadInternal(
+        const Replica::Descriptor& replica_descriptor,
+        std::vector<Slice>& slices, uint64_t src_offset);
+    ErrorCode TransferWrite(const Replica::Descriptor& replica_descriptor,
+                            std::vector<Slice>& slices);
+    ErrorCode TransferRead(const Replica::Descriptor& replica_descriptor,
+                           std::vector<Slice>& slices);
+    ErrorCode TransferReadRange(const Replica::Descriptor& replica_descriptor,
+                                std::vector<Slice>& slices,
+                                uint64_t src_offset);
+
+    /**
+     * @brief Prepare and use the storage backend for persisting data
+     */
+    void PrepareStorageBackend(const std::string& storage_root_dir,
+                               const std::string& fsdir,
+                               bool enable_eviction = true,
+                               uint64_t quota_bytes = 0);
+
+    void PutToLocalFile(const std::string& object_key,
+                        const std::vector<Slice>& slices,
+                        const DiskDescriptor& disk_descriptor);
+    /**
+     * @brief Initialize local hot cache
+     * @return ErrorCode::OK if use local hot cache,
+     * ErrorCode::INVALID_PARAMS if invalid MC_STORE_LOCAL_HOT_CACHE_SIZE config
+     */
+    ErrorCode InitLocalHotCache();
+
+    /**
+     * @brief Read MC_STORE_LOCAL_HOT_CACHE_SIZE from environment variable
+     * @return Cache size in bytes, or 0 if not set or invalid
+     */
+    size_t GetLocalHotCacheSizeFromEnv();
+
+    /**
+     * @brief Read MC_STORE_LOCAL_HOT_BLOCK_SIZE from environment variable
+     * @param default_value Default block size to use if env var is not set or
+     * invalid
+     * @return Parsed block size from environment, or default_value if not
+     * set/invalid
+     */
+    size_t GetLocalHotBlockSizeFromEnv(size_t default_value);
+
+    /**
+     * @brief Redirect replica descriptor to local hot cache if cache hit
+     * @param key Object key
+     * @param replica Replica descriptor
+     * @return true if cache hit and replica descriptor was updated, false
+     * otherwise
+     */
+    bool RedirectToHotCache(const std::string& key,
+                            Replica::Descriptor& replica);
+
+    /**
+     * @brief Asynchronously process slices and update hot cache for TE
+     * transfers.
+     * @param key Object key.
+     * @param slices Vector of slices to check and cache.
+     * @param replica Replica descriptor to identify slice sources.
+     */
+    void ProcessSlicesAsync(const std::string& key,
+                            const std::vector<Slice>& slices,
+                            const Replica::Descriptor& replica);
+
+    /**
+     * @brief Find the first complete replica from a replica list
+     * @param replica_list List of replicas to search through
+     * @param replica the first complete replica (file or memory)
+     * @return ErrorCode::OK if found, ErrorCode::INVALID_REPLICA if no complete
+     * replica
+     */
+    ErrorCode FindFirstCompleteReplica(
+        const std::vector<Replica::Descriptor>& replica_list,
+        Replica::Descriptor& replica);
+
+    /**
+     * @brief Batch put helper methods for structured approach
+     */
+    std::vector<PutOperation> CreatePutOperations(
+        const std::vector<ObjectKey>& keys,
+        const std::vector<std::vector<Slice>>& batched_slices);
+    void StartBatchPut(std::vector<PutOperation>& ops,
+                       const ReplicateConfig& config);
+    void SubmitTransfers(std::vector<PutOperation>& ops);
+    void WaitForTransfers(std::vector<PutOperation>& ops);
+    void FinalizeBatchPut(std::vector<PutOperation>& ops);
+    void StartBatchUpsert(std::vector<PutOperation>& ops,
+                          const ReplicateConfig& config);
+    void FinalizeBatchUpsert(std::vector<PutOperation>& ops);
+    std::vector<tl::expected<void, ErrorCode>> CollectResults(
+        const std::vector<PutOperation>& ops);
+
+    std::vector<tl::expected<void, ErrorCode>> BatchPutWhenPreferSameNode(
+        std::vector<PutOperation>& ops);
+    std::vector<tl::expected<void, ErrorCode>> BatchGetWhenPreferSameNode(
+        const std::vector<std::string>& object_keys,
+        const std::vector<QueryResult>& query_results,
+        std::unordered_map<std::string, std::vector<Slice>>& slices);
+
+    // Client identification
+    const UUID client_id_;
+
+    // Client-side metrics
+    std::unique_ptr<ClientMetric> metrics_;
+
+    // Core components
+    std::shared_ptr<TransferEngine> transfer_engine_;
+    MasterClient master_client_;
+    std::unique_ptr<TransferSubmitter> transfer_submitter_;
+
+    // Mutex to protect mounted_segments_
+    std::mutex mounted_segments_mutex_;
+    std::unordered_map<UUID, Segment, boost::hash<UUID>> mounted_segments_;
+
+    /**
+     * @brief Internal helper to unmount a segment by iterator.
+     *        Caller must hold mounted_segments_mutex_.
+     */
+    tl::expected<void, ErrorCode> UnmountSegmentImpl(
+        std::unordered_map<UUID, Segment, boost::hash<UUID>>::iterator it);
+
+    // Configuration
+    const std::string local_hostname_;
+    const std::string metadata_connstring_;
+    const std::string protocol_;
+
+    // Client persistent thread pool for async operations
+    // Pinned host memory pool for GPU D2H staging (must outlive
+    // write_thread_pool_)
+    std::unique_ptr<PinnedBufferPool> pinned_buffer_pool_;
+    ThreadPool write_thread_pool_;
+    std::shared_ptr<StorageBackend> storage_backend_;
+
+    // For high availability
+    std::unique_ptr<ha::LeaderCoordinator> leader_coordinator_;
+    std::mutex leader_switch_mutex_;
+    std::optional<ha::MasterView> current_master_view_;
+    std::string direct_master_address_;
+    std::thread leader_monitor_thread_;
+    std::atomic<bool> leader_monitor_running_{false};
+    std::thread storage_heartbeat_thread_;
+    std::atomic<bool> storage_heartbeat_running_{false};
+    std::thread task_poll_thread_;
+    std::atomic<bool> task_poll_running_{false};
+    std::atomic<bool> last_ping_success_{false};
+    ErrorCode SwitchLeader(const ha::MasterView& target_view);
+    void LeaderMonitorThreadMain();
+    void StorageHeartbeatThreadMain();
+    void TaskPollThreadMain();
+    void EnsureStorageControlPlaneStarted();
+    void PollAndDispatchTasks();
+    void SubmitTask(const TaskAssignment& assignment);
+
+    // For task management
+    // Client-side task representation
+    struct ClientTask {
+        TaskAssignment assignment;
+        uint32_t retry_count = 0;
+
+        void increment_retry() { retry_count++; }
+    };
+
+    void ExecuteTask(const ClientTask& client_task);
+
+    tl::expected<void, ErrorCode> ExecuteReplicaTransfer(
+        const std::string& key, const std::string& action_name,
+        std::function<tl::expected<void, ErrorCode>()> end_fn,
+        std::function<tl::expected<void, ErrorCode>()> revoke_fn,
+        const Replica::Descriptor& source,
+        const std::vector<Replica::Descriptor>& targets);
+
+    /**
+     * @brief Copy an object's replica to target segments
+     * @param key Object key
+     * @param source Source segment
+     * @param targets Target segments
+     * @return tl::expected<void, ErrorCode> indicating success/failure
+     */
+    tl::expected<void, ErrorCode> Copy(const std::string& key,
+                                       const std::string& source,
+                                       const std::vector<std::string>& targets);
+
+    /**
+     * @brief Move an object's replica from source segment to target segment
+     * @param key Object key
+     * @param source Source segment
+     * @param target Target segment
+     * @return tl::expected<void, ErrorCode> indicating success/failure
+     */
+    tl::expected<void, ErrorCode> Move(const std::string& key,
+                                       const std::string& source,
+                                       const std::string& target);
+
+    // Task thread pool for async task execution
+    ThreadPool task_thread_pool_;
+    std::atomic<bool> task_running_{true};
+
+    // Task polling configuration
+    static constexpr size_t kTaskBatchSize =
+        16;  // Number of tasks to fetch per poll
+
+    bool te_initialized_{false};
+
+    // Local hot cache and async handler
+    std::shared_ptr<LocalHotCache> hot_cache_;
+    std::unique_ptr<LocalHotCacheHandler> hot_cache_handler_;
+
+    // Frequency admission: only cache keys whose CMS count >= threshold
+    std::unique_ptr<CountMinSketch> admission_sketch_;
+    uint8_t admission_threshold_ = 2;
+};
+
+}  // namespace mooncake

@@ -1,0 +1,24 @@
+run-ci:
+  - changed-files:
+    - any-glob-to-any-file:
+      - '**/*'
+
+store:
+  - changed-files:
+    - any-glob-to-any-file: 'mooncake-store/**/*'
+
+Transfer Engine:
+  - changed-files:
+    - any-glob-to-any-file: 'mooncake-transfer-engine/**/*'
+
+PyTorch Backend:
+  - changed-files:
+    - any-glob-to-any-file: 'mooncake-pg/**/*'
+
+Mooncake EP:
+  - changed-files:
+    - any-glob-to-any-file: 'mooncake-ep/**/*'
+
+Installation:
+  - changed-files:
+    - any-glob-to-any-file: 'mooncake-wheel/**/*'

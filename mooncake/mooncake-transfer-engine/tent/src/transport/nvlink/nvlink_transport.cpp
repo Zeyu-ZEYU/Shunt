@@ -1,0 +1,402 @@
+// Copyright 2024 KVCache.AI
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+#include "tent/transport/nvlink/nvlink_transport.h"
+
+#include <bits/stdint-uintn.h>
+#include <glog/logging.h>
+#include <sys/mman.h>
+
+#include <algorithm>
+#include <cassert>
+#include <cstddef>
+#include <cstdint>
+#include <iomanip>
+#include <memory>
+
+#include "tent/common/status.h"
+#include "tent/runtime/slab.h"
+#include "tent/runtime/control_plane.h"
+#include "tent/common/utils/random.h"
+#include "tent/common/utils/string_builder.h"
+
+namespace mooncake {
+namespace tent {
+
+NVLinkTransport::NVLinkTransport() : installed_(false) {}
+
+NVLinkTransport::~NVLinkTransport() { uninstall(); }
+
+Status NVLinkTransport::install(std::string& local_segment_name,
+                                std::shared_ptr<ControlService> metadata,
+                                std::shared_ptr<Topology> local_topology,
+                                std::shared_ptr<Config> conf) {
+    if (installed_) {
+        return Status::InvalidArgument(
+            "NVLink transport has been installed" LOC_MARK);
+    }
+
+    platform_ = dynamic_cast<CudaPlatform*>(&Platform::getLoader());
+    metadata_ = metadata;
+    local_segment_name_ = local_segment_name;
+    local_topology_ = local_topology;
+    conf_ = conf;
+    machine_id_ = metadata->segmentManager().getLocal()->machine_id;
+    installed_ = true;
+    async_memcpy_threshold_ =
+        conf_->get("transports/nvlink/async_memcpy_threshold", 0) * 1024;
+    host_register_ = conf_->get("transports/nvlink/host_register", false);
+    caps.dram_to_gpu = true;
+    caps.gpu_to_dram = true;
+    caps.gpu_to_gpu = true;
+    return setPeerAccess();
+}
+
+Status NVLinkTransport::uninstall() {
+    if (installed_) {
+        metadata_.reset();
+        for (auto& relocate_map : relocate_map_) {
+            for (auto& entry : relocate_map.second) {
+                CHECK_CUDA(cudaIpcCloseMemHandle(entry.second.shm_addr));
+            }
+        }
+        relocate_map_.clear();
+        installed_ = false;
+    }
+    return Status::OK();
+}
+
+Status NVLinkTransport::allocateSubBatch(SubBatchRef& batch, size_t max_size) {
+    auto shm_batch = Slab<NVLinkSubBatch>::Get().allocate();
+    if (!shm_batch)
+        return Status::InternalError("Unable to allocate NVLink sub-batch");
+    batch = shm_batch;
+    shm_batch->task_list.reserve(max_size);
+    shm_batch->max_size = max_size;
+    CHECK_STATUS(platform_->getStreamFromPool(shm_batch->sync_stream));
+    CHECK_STATUS(platform_->getStreamFromPool(shm_batch->async_stream));
+    return Status::OK();
+}
+
+Status NVLinkTransport::freeSubBatch(SubBatchRef& batch) {
+    auto shm_batch = dynamic_cast<NVLinkSubBatch*>(batch);
+    if (!shm_batch)
+        return Status::InvalidArgument("Invalid NVLink sub-batch" LOC_MARK);
+    // CHECK_CUDA(cudaStreamDestroy(shm_batch->stream));
+    Slab<NVLinkSubBatch>::Get().deallocate(shm_batch);
+    batch = nullptr;
+    return Status::OK();
+}
+
+Status NVLinkTransport::submitTransferTasks(
+    SubBatchRef batch, const std::vector<Request>& request_list) {
+    auto shm_batch = dynamic_cast<NVLinkSubBatch*>(batch);
+    if (!shm_batch)
+        return Status::InvalidArgument("Invalid NVLink sub-batch" LOC_MARK);
+    if (request_list.size() + shm_batch->task_list.size() > shm_batch->max_size)
+        return Status::TooManyRequests("Exceed batch capacity" LOC_MARK);
+    std::vector<NVLinkTask*> new_tasks;
+    for (auto& request : request_list) {
+        shm_batch->task_list.push_back(NVLinkTask{});
+        auto& task = shm_batch->task_list[shm_batch->task_list.size() - 1];
+        uint64_t target_addr = request.target_offset;
+        if (request.target_id != LOCAL_SEGMENT_ID) {
+            auto status = relocateSharedMemoryAddress(
+                target_addr, request.length, request.target_id);
+            if (!status.ok()) return status;
+        }
+        task.target_addr = target_addr;
+        task.request = request;
+        task.status_word = TransferStatusEnum::PENDING;
+        new_tasks.push_back(&task);
+    }
+    startTransfer(new_tasks, shm_batch);
+    return Status::OK();
+}
+
+void NVLinkTransport::startTransfer(std::vector<NVLinkTask*>& tasks,
+                                    NVLinkSubBatch* batch) {
+    if (tasks.empty()) return;
+
+    std::vector<void*> srcs;
+    std::vector<void*> dsts;
+    std::vector<size_t> sizes;
+    for (auto* task : tasks) {
+        void *src = nullptr, *dst = nullptr;
+        if (task->request.opcode == Request::READ) {
+            dst = task->request.source;      // read into source buffer
+            src = (void*)task->target_addr;  // from remote
+        } else {
+            src = task->request.source;      // write from source buffer
+            dst = (void*)task->target_addr;  // to remote
+        }
+        srcs.push_back(src);
+        dsts.push_back(dst);
+        sizes.push_back(task->request.length);
+    }
+
+    cudaError_t err;
+
+#if CUDART_VERSION >= 13000
+    cudaMemcpyAttributes attr{};
+    attr.srcAccessOrder = cudaMemcpySrcAccessOrderStream;
+    size_t attrs_idx = 0;
+    err = cudaMemcpyBatchAsync(const_cast<const void**>(dsts.data()),
+                               const_cast<const void**>(srcs.data()),
+                               sizes.data(), srcs.size(), &attr, &attrs_idx, 1,
+                               batch->async_stream.get());
+#elif CUDART_VERSION >= 12080
+    cudaMemcpyAttributes attr{};
+    attr.srcAccessOrder = cudaMemcpySrcAccessOrderStream;
+    size_t attrs_idx = 0;
+    size_t fail_idx = tasks.size();
+    err = cudaMemcpyBatchAsync(dsts.data(), srcs.data(), sizes.data(),
+                               srcs.size(), &attr, &attrs_idx, 1, &fail_idx,
+                               batch->async_stream.get());
+    if (err != cudaSuccess && fail_idx < tasks.size()) {
+        LOG(ERROR) << "NVLinkTransport::startTransfer internal error: "
+                   << "cudaMemcpyBatchAsync failed at task index " << fail_idx
+                   << " (src=" << srcs[fail_idx] << ", dst=" << dsts[fail_idx]
+                   << ", size=" << sizes[fail_idx]
+                   << "): " << cudaGetErrorString(err);
+        tasks[fail_idx]->status_word = TransferStatusEnum::FAILED;
+    }
+#else
+    err = cudaSuccess;
+    for (size_t i = 0; i < tasks.size(); ++i) {
+        auto single_err =
+            cudaMemcpyAsync(dsts[i], srcs[i], sizes[i], cudaMemcpyDefault,
+                            batch->async_stream.get());
+        if (single_err != cudaSuccess) {
+            tasks[i]->status_word = TransferStatusEnum::FAILED;
+            err = single_err;
+        }
+    }
+#endif
+
+    if (err != cudaSuccess) {
+        for (auto* task : tasks) {
+            if (task->status_word == TransferStatusEnum::PENDING)
+                task->status_word = TransferStatusEnum::FAILED;
+        }
+    }
+
+    cudaEvent_t event;
+    cudaEventCreateWithFlags(&event, cudaEventDisableTiming);
+    cudaEventRecord(event, batch->async_stream.get());
+    for (auto* task : tasks) task->completion_event = event;
+}
+
+Status NVLinkTransport::getTransferStatus(SubBatchRef batch, int task_id,
+                                          TransferStatus& status) {
+    auto shm_batch = dynamic_cast<NVLinkSubBatch*>(batch);
+    if (task_id < 0 || task_id >= (int)shm_batch->task_list.size()) {
+        return Status::InvalidArgument("Invalid task id" LOC_MARK);
+    }
+    auto& task = shm_batch->task_list[task_id];
+    status = TransferStatus{task.status_word, task.transferred_bytes};
+    if (task.status_word == TransferStatusEnum::PENDING) {
+        auto err = cudaEventQuery(task.completion_event);
+        if (err == cudaSuccess) {
+            task.transferred_bytes = task.request.length;
+            task.status_word = TransferStatusEnum::COMPLETED;
+        } else if (err != cudaErrorNotReady) {
+            task.status_word = TransferStatusEnum::FAILED;
+        }
+    }
+    return Status::OK();
+}
+
+Status NVLinkTransport::addMemoryBuffer(BufferDesc& desc,
+                                        const MemoryOptions& options) {
+    LocationParser location(desc.location);
+    if (location.type() == "cuda") {
+        // If the memory region is allocated using cuMemAlloc,
+        // we cannot use cudaIpcGetMemHandle, so skip it
+        if (options.type == MNNVL) return Status::OK();
+
+        // Resolve the true cudaMalloc base address. Caching allocators
+        // (e.g. PyTorch) sub-allocate tensors within larger cudaMalloc
+        // segments. cudaIpcGetMemHandle returns a handle for the whole
+        // segment, so we need to register at segment granularity.
+        CUdeviceptr base_ptr = 0;
+        size_t alloc_size = 0;
+        CUresult cu_err = cuMemGetAddressRange(&base_ptr, &alloc_size,
+                                               (CUdeviceptr)desc.addr);
+        if (cu_err != CUDA_SUCCESS) {
+            LOG(ERROR) << "NVLinkTransport: cuMemGetAddressRange failed for "
+                       << "addr 0x" << std::hex << desc.addr << std::dec
+                       << " (error " << cu_err << ")";
+            return Status::InternalError(
+                "cuMemGetAddressRange failed" LOC_MARK);
+        }
+
+        {
+            std::lock_guard<std::mutex> lock(register_mutex_);
+            if (registered_base_addrs_.count((uint64_t)base_ptr)) {
+                // Already registered this cudaMalloc block, just tag transport
+                desc.addr = (uint64_t)base_ptr;
+                desc.length = alloc_size;
+                desc.transports.push_back(TransportType::NVLINK);
+                return Status::OK();
+            }
+        }
+
+        cudaIpcMemHandle_t handle;
+        CHECK_CUDA(cudaIpcGetMemHandle(&handle, (void*)base_ptr));
+        desc.addr = (uint64_t)base_ptr;
+        desc.length = alloc_size;
+        desc.shm_path =
+            serializeBinaryData(&handle, sizeof(cudaIpcMemHandle_t));
+
+        {
+            std::lock_guard<std::mutex> lock(register_mutex_);
+            registered_base_addrs_.insert((uint64_t)base_ptr);
+        }
+    } else if (location.type() == "cpu" ||
+               location.type() == kWildcardLocation) {
+        if (host_register_)
+            CHECK_CUDA(cudaHostRegister(((void*)desc.addr), desc.length,
+                                        cudaHostRegisterDefault));
+    } else
+        return Status::InvalidArgument(
+            "Unrecognized location - neither cpu or cuda: " + location.type());
+    desc.transports.push_back(TransportType::NVLINK);
+    return Status::OK();
+}
+
+Status NVLinkTransport::removeMemoryBuffer(BufferDesc& desc) {
+    LocationParser location(desc.location);
+    if (location.type() == "cuda") {
+        // Resolve base the same way we did in addMemoryBuffer, so we
+        // remove the right entry even for sub-allocated addresses.
+        CUdeviceptr base_ptr = 0;
+        size_t alloc_size = 0;
+        CUresult cu_err = cuMemGetAddressRange(&base_ptr, &alloc_size,
+                                               (CUdeviceptr)desc.addr);
+
+        uint64_t key = desc.addr;
+        if (cu_err == CUDA_SUCCESS) {
+            key = (uint64_t)base_ptr;
+        } else {
+            LOG(WARNING) << "NVLinkTransport: cuMemGetAddressRange failed for "
+                         << "addr 0x" << std::hex << desc.addr << std::dec
+                         << " during removal (error " << cu_err
+                         << "). Memory may already be freed.";
+        }
+
+        {
+            std::lock_guard<std::mutex> lock(register_mutex_);
+            registered_base_addrs_.erase(key);
+        }
+    } else if (location.type() == "cpu" && host_register_) {
+        CHECK_CUDA(cudaHostUnregister((void*)desc.addr));
+    }
+    desc.shm_path.clear();
+    return Status::OK();
+}
+
+Status NVLinkTransport::relocateSharedMemoryAddress(uint64_t& dest_addr,
+                                                    uint64_t length,
+                                                    uint64_t target_id) {
+    thread_local HashMap tl_relocate_map;
+    if (tl_relocate_map.empty()) {
+        RWSpinlock::ReadGuard guard(relocate_lock_);
+        tl_relocate_map = relocate_map_;
+    }
+
+    for (auto& entry : tl_relocate_map[target_id]) {
+        if (entry.first <= dest_addr &&
+            dest_addr + length <= entry.first + entry.second.length) {
+            auto shm_addr = entry.second.shm_addr;
+            dest_addr = dest_addr - entry.first + ((uint64_t)shm_addr);
+            return Status::OK();
+        }
+    }
+
+    RWSpinlock::WriteGuard guard(relocate_lock_);
+
+    BufferDesc* buffer;
+    auto& segment_manager = metadata_->segmentManager();
+    CHECK_STATUS(
+        segment_manager.withCachedSegment(target_id, [&](SegmentDesc* segment) {
+            buffer = segment->findBuffer(dest_addr, length);
+            if (!buffer || buffer->shm_path.empty())
+                return Status::NeedsRefreshCache(
+                    "Requested address is not in registered buffer" LOC_MARK);
+            return Status::OK();
+        }));
+
+    if (!relocate_map_[target_id].count(buffer->addr)) {
+        void* shm_addr = nullptr;
+        LocationParser location(buffer->location);
+        if (location.type() != "cuda") {
+            return Status::InvalidArgument(
+                "Requested address is not in registered CUDA buffer" LOC_MARK);
+        }
+        std::vector<unsigned char> output_buffer;
+        deserializeBinaryData(buffer->shm_path, output_buffer);
+        cudaIpcMemHandle_t handle;
+        memcpy(&handle, output_buffer.data(), sizeof(handle));
+        int cuda_dev = 0;
+        CHECK_CUDA(cudaGetDevice(&cuda_dev));
+        cudaSetDevice(location.index());
+        CHECK_CUDA(cudaIpcOpenMemHandle(&shm_addr, handle,
+                                        cudaIpcMemLazyEnablePeerAccess));
+        cudaSetDevice(cuda_dev);
+        OpenedShmEntry shm_entry;
+        shm_entry.shm_addr = shm_addr;
+        shm_entry.length = buffer->length;
+        shm_entry.cuda_id = location.index();
+        relocate_map_[target_id][buffer->addr] = shm_entry;
+        tl_relocate_map = relocate_map_;
+    }
+
+    auto shm_addr = relocate_map_[target_id][buffer->addr].shm_addr;
+    dest_addr = dest_addr - buffer->addr + ((uint64_t)shm_addr);
+    return Status::OK();
+}
+
+Status NVLinkTransport::setPeerAccess() {
+    int device_count = 0;
+    int cuda_dev = 0;
+    CHECK_CUDA(cudaGetDevice(&cuda_dev));
+    CHECK_CUDA(cudaGetDeviceCount(&device_count));
+    if (device_count < 2) return Status::OK();
+    for (int i = 0; i < device_count; ++i) {
+        cudaSetDevice(i);
+        for (int j = 0; j < device_count; ++j) {
+            if (i == j) continue;
+            int can_access = 0;
+            cudaDeviceCanAccessPeer(&can_access, i, j);
+            if (!can_access) {
+                continue;
+            }
+            cudaError_t err = cudaDeviceEnablePeerAccess(j, 0);
+            if (err != cudaSuccess) {
+                if (err == cudaErrorPeerAccessAlreadyEnabled) {
+                    cudaGetLastError();
+                } else {
+                    cudaSetDevice(cuda_dev);
+                    return Status::InternalError(
+                        "cudaDeviceEnablePeerAccess failed");
+                }
+            }
+        }
+    }
+    cudaSetDevice(cuda_dev);
+    return Status::OK();
+}
+}  // namespace tent
+}  // namespace mooncake

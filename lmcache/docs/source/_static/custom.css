@@ -1,0 +1,70 @@
+/* Force white background on all Mermaid diagrams and fix sizing */
+.mermaid {
+    background-color: #ffffff !important;
+    padding: 10px !important;
+    border-radius: 8px !important;
+    margin: 10px 0 !important;
+    display: flex !important;
+    justify-content: center !important;
+}
+
+.mermaid svg {
+    background-color: #ffffff !important;
+    height: auto !important;
+    max-height: 300px !important;
+}
+
+/* Tighter fit for flowcharts */
+.mermaid[data-processed="true"] {
+    overflow: visible !important;
+}
+
+.mermaid svg[id^="flowchart"] {
+    max-height: 250px !important;
+}
+
+/* Hide extra buttons if multiple are showing */
+div.highlight button.copybtn + button.copybtn {
+    display: none;
+  }
+  
+  /* Remove unwanted "Copy code" text from clipboard (for older versions) */
+  .copybtn::before {
+    content: none !important;
+  }
+  
+  /* Style the copy button */
+  button.copybtn {
+    background-color: #4a90e2;
+    color: white;
+    border: none;
+    border-radius: 5px;
+    font-size: 12px;
+    padding: 4px 8px;
+    cursor: pointer;
+    position: absolute;
+    top: 0.4em;
+    right: 0.6em;
+    opacity: 0.8;
+    transition: opacity 0.2s ease-in-out;
+    z-index: 3;
+  }
+  
+  button.copybtn:hover {
+    opacity: 1;
+  }
+  
+  /* Optional: Hide the copied tooltip or style it */
+  .copybtn:after {
+    content: "Copied!";
+    display: none;
+    position: absolute;
+    top: -1.5em;
+    right: 0;
+    background: #333;
+    color: #fff;
+    padding: 2px 6px;
+    border-radius: 3px;
+    font-size: 10px;
+  }
+  
