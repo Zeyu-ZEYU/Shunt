@@ -163,6 +163,7 @@ int RdmaEndPoint::setupConnectionsByActive() {
             auto segment_desc =
                 context_.engine().meta()->getSegmentDescByID(LOCAL_SEGMENT_ID);
             if (segment_desc) {
+                traffic_class_ = context_.engine().trafficClass();
                 for (auto &nic : segment_desc->devices)
                     if (nic.name == context_.deviceName())
                         return doSetupConnection(nic.gid, nic.lid, qpNum());
@@ -191,6 +192,7 @@ int RdmaEndPoint::setupConnectionsByActive() {
             local_desc.local_nic_path = context_.nicPath();
             local_desc.peer_nic_path = peer_nic_path_;
             local_desc.qp_num = qpNum();
+            local_desc.traffic_class = context_.engine().trafficClass();
         }
     }
 
@@ -295,6 +297,7 @@ int RdmaEndPoint::setupConnectionsByActive() {
     if (segment_desc) {
         for (auto &nic : segment_desc->devices) {
             if (nic.name == peer_nic_name) {
+                traffic_class_ = context_.engine().trafficClass();
                 int ret = doSetupConnection(nic.gid, nic.lid, peer_desc.qp_num);
                 if (ret != 0) {
                     resetConnection("failed connection setup (active)");
@@ -318,6 +321,7 @@ int RdmaEndPoint::setupConnectionsByPassive(const HandShakeDesc &peer_desc,
             local_desc.local_nic_path = context_.nicPath();
             local_desc.peer_nic_path = peer_nic_path_;
             local_desc.qp_num = qpNum();
+            local_desc.traffic_class = traffic_class_;
             LOG(INFO) << "Received same peer QP numbers, reusing connection.";
             return 0;
         }
@@ -359,6 +363,10 @@ int RdmaEndPoint::setupConnectionsByPassive(const HandShakeDesc &peer_desc,
     local_desc.local_nic_path = context_.nicPath();
     local_desc.peer_nic_path = peer_nic_path_;
     local_desc.qp_num = qpNum();
+    traffic_class_ = peer_desc.traffic_class >= 0
+                         ? peer_desc.traffic_class
+                         : context_.engine().trafficClass();
+    local_desc.traffic_class = traffic_class_;
 
     auto segment_desc =
         context_.engine().meta()->getSegmentDescByName(peer_server_name);
@@ -622,9 +630,8 @@ int RdmaEndPoint::doSetupConnection(int qp_index, const std::string &peer_gid,
     attr.ah_attr.grh.sgid_index = context_.gidIndex();
     attr.ah_attr.grh.hop_limit = MAX_HOP_LIMIT;
     // Set traffic class if configured (-1 means use default)
-    if (globalConfig().ib_traffic_class >= 0) {
-        attr.ah_attr.grh.traffic_class =
-            static_cast<uint8_t>(globalConfig().ib_traffic_class);
+    if (traffic_class_ >= 0) {
+        attr.ah_attr.grh.traffic_class = static_cast<uint8_t>(traffic_class_);
     }
     attr.ah_attr.dlid = peer_lid;
     attr.ah_attr.sl = 0;

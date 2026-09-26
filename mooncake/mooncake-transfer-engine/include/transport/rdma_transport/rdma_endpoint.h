@@ -162,6 +162,11 @@ class RdmaEndPoint {
 
     std::string peer_nic_path_;
     std::vector<uint32_t> peer_qp_num_list_;
+    // RDMA traffic class of this connection's QPs (-1: device default): the
+    // engine's class when this side connects, the peer's class when the peer
+    // does, so both directions of a connection (e.g. RDMA READ responses)
+    // carry the class of the side that opened it.
+    int traffic_class_ = -1;
 
     volatile int *wr_depth_list_;
     int max_wr_depth_;

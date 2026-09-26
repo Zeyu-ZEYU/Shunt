@@ -127,6 +127,9 @@ class TransferMetadata {
 #endif
         std::vector<uint32_t> qp_num;
         std::string reply_msg;  // on error
+        // RDMA traffic class of the sender's QPs (-1: device default). The
+        // passive side adopts the active side's class for the connection.
+        int traffic_class = -1;
 #ifdef USE_EFA
         std::string efa_addr;  // EFA endpoint address (hex encoded)
 #endif

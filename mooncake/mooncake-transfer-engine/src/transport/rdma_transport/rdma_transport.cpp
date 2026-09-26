@@ -19,6 +19,7 @@
 #include <sys/time.h>
 
 #include <cassert>
+#include <cstdlib>
 #include <chrono>
 #include <cstddef>
 #include <future>
@@ -100,6 +101,15 @@ int RdmaTransport::install(std::string &local_server_name,
     metadata_ = meta;
     local_server_name_ = local_server_name;
     local_topology_ = topo;
+
+    traffic_class_ = globalConfig().ib_traffic_class;
+    if (const char *tc_env = std::getenv("MC_IB_TC")) {
+        try {
+            int tc = std::stoi(tc_env);
+            if (tc >= 0 && tc <= 255) traffic_class_ = tc;
+        } catch (const std::exception &) {
+        }
+    }
 
     auto ret = initializeRdmaResources();
     if (ret) {

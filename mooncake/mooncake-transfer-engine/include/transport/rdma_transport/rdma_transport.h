@@ -129,6 +129,13 @@ class RdmaTransport : public Transport {
    private:
     std::vector<std::shared_ptr<RdmaContext>> context_list_;
     std::shared_ptr<Topology> local_topology_;
+    // RDMA traffic class of this engine's QPs, read from MC_IB_TC when the
+    // transport is installed, so engines of one process can use different
+    // classes (-1: device default).
+    int traffic_class_ = -1;
+
+   public:
+    int trafficClass() const { return traffic_class_; }
 };
 
 using TransferRequest = Transport::TransferRequest;
