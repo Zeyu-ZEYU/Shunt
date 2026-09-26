@@ -432,10 +432,31 @@ class MooncakestoreConnector(RemoteConnector):
         if self.config.prefer_local_alloc:
             self.replica_config.preferred_segment = self.store.get_hostname()
 
-        # Register CPU buffer for zero-copy operations
-        self._register_cpu_buffer()
+        # Shunt KVLB: a per-port client registers only its own private pool
+        # (attach_pool), never the shared CPU buffer.
+        self.pool = None
+        extra = (lmcache_config.extra_config or {}) if lmcache_config else {}
+        if not extra.get("shunt_private_pool", False):
+            # Register CPU buffer for zero-copy operations
+            self._register_cpu_buffer()
 
         logger.info("MooncakeConnector initialized successfully.")
+
+    def attach_pool(self, pool) -> None:
+        """Shunt KVLB: use a private KVPool for this client's transfers."""
+        pool.register_with_store(self.store)
+        self.pool = pool
+
+    def _stage(self, obj: MemoryObj) -> Optional[MemoryObj]:
+        """Copy a chunk into the private pool if it lives elsewhere."""
+        if self.pool is None or self.pool.owns(obj.data_ptr):
+            return None
+        m = obj.metadata
+        staged = self.pool.allocate(m.shapes or m.shape, m.dtypes or m.dtype, m.fmt)
+        if staged is None:
+            return None
+        staged.raw_tensor.copy_(obj.raw_tensor[: staged.raw_tensor.numel()])
+        return staged
 
     def _register_cpu_buffer(self):
         """Register CPU buffer for zero-copy operations."""
@@ -545,10 +566,9 @@ class MooncakestoreConnector(RemoteConnector):
         buffer_ptrs: list[int] = []
         buffer_sizes: list[int] = []
 
+        alloc = self.pool if self.pool is not None else self.local_cpu_backend
         for i, _ in enumerate(keys):
-            obj = self.local_cpu_backend.allocate(
-                self.meta_shapes, self.meta_dtypes, self.meta_fmt
-            )
+            obj = alloc.allocate(self.meta_shapes, self.meta_dtypes, self.meta_fmt)
             memory_objs.append(obj)
             if obj is not None and obj.raw_tensor is not None:
                 valid_idx.append(i)
@@ -721,8 +741,13 @@ class MooncakestoreConnector(RemoteConnector):
         key_strs = [k.to_string() for k in keys]
         buffer_ptrs: list[int] = []
         buffer_sizes: list[int] = []
+        staged_objs: list[MemoryObj] = []
         for obj in memory_objs:
             assert obj.raw_tensor is not None
+            staged = self._stage(obj)
+            if staged is not None:
+                staged_objs.append(staged)
+                obj = staged
             buffer_ptrs.append(obj.data_ptr)
             buffer_sizes.append(obj.get_size())
 
@@ -741,6 +766,9 @@ class MooncakestoreConnector(RemoteConnector):
             logger.warning(
                 "Timeout during batch_put_from; some decoders may redo prefill."
             )
+        finally:
+            for staged in staged_objs:
+                staged.ref_count_down()
 
     async def _batched_put_with_metadata(
         self,

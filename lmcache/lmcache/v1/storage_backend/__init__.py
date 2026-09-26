@@ -232,6 +232,23 @@ def CreateStorageBackends(
         maru_backend = MaruBackend(config, metadata, loop, dst_device)
         storage_backends[str(maru_backend)] = maru_backend
 
+    # Shunt KVLB: one Mooncake client per RDMA device of the node, and a
+    # per-chunk choice of device from the iteration's KV plan (replaces the
+    # single remote backend of remote_url).
+    shunt_kvlb = bool(
+        config.extra_config and config.extra_config.get("shunt_kvlb_enabled")
+    )
+    if shunt_kvlb and metadata.role != "scheduler" and "RoutingBackend" not in _skip:
+        assert local_cpu_backend is not None, (
+            "Shunt KVLB requires the local CPU backend (max_local_cpu_size > 0)."
+        )
+        # First Party
+        from lmcache.v1.storage_backend.routing_backend import RoutingBackend
+
+        storage_backends["RoutingBackend"] = RoutingBackend(
+            config, metadata, loop, local_cpu_backend, dst_device
+        )
+
     # Handle remote storage plugins (new way)
     if config.remote_storage_plugins and "RemoteBackend" not in _skip:
         for plugin_name in config.remote_storage_plugins:
@@ -262,7 +279,11 @@ def CreateStorageBackends(
                 )
 
     # Handle legacy remote_url (deprecated but still supported)
-    if config.remote_url is not None and "RemoteBackend" not in _skip:
+    if (
+        config.remote_url is not None
+        and "RemoteBackend" not in _skip
+        and not (shunt_kvlb and metadata.role != "scheduler")
+    ):
         # Log deprecation warning
         logger.warning(
             "remote_url is deprecated and will be removed in a future release. "
